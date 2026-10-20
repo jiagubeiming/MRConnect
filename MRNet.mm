@@ -1,10 +1,8 @@
-// MRNet.mm —— 进程内网络拦截（安卓 libmroffline.so offline_hook_connect 的 iOS 同构版）
+// MRNet.mm v3 —— 加入调用计数打印，确认拦截器是否被调用
 //
-// 两条路都试，优先级：
-//   1) MSHookFunction（有 Substrate/ElleKit 时最可靠，改函数体指令）
-//   2) fishhook（改 Mach-O 导入表，不需要任何运行时库 → 巨魔/未越狱也能用）
-//
-// 只要任意一条成功，就把到 gameloft 的连接改向本地假服务器。
+// v2 问题：fishhook 命中 3 个指针但日志里没有 REDIR/DNS，
+// 说明拦截生效但游戏没发请求，或发了没走到这两个函数。
+// v3 加一个定时统计线程，每 10 秒打印各自调用次数。
 
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
@@ -16,7 +14,6 @@
 #import <time.h>
 #import <unistd.h>
 #import <sys/socket.h>
-#import <netinet/in.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #import <netdb.h>
@@ -25,7 +22,6 @@
 #include "substrate.h"
 #include "fishhook.h"
 
-// ── 配置 ─────────────────────────────────────────────────────────────
 static const char *kLocalHost = "192.168.123.83";
 static const int   kLocalPort = 443;
 static const int   kHookAnyPort = 1;
@@ -34,9 +30,16 @@ static const char *kDomains[] = {
     "gameloft.com", "gameloft.net", "gameloft.org", NULL
 };
 
-// ── 日志 ─────────────────────────────────────────────────────────────
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 static char gLogPath[512] = {0};
+
+// 调用计数
+static volatile int gConnectCalls = 0;
+static volatile int gConnectRedirects = 0;
+static volatile int gGaCalls = 0;
+static volatile int gGaHits = 0;
+static volatile int gGhCalls = 0;
+static volatile int gGhHits = 0;
 
 static void logOpen(void) {
     const char *cands[] = {
@@ -74,7 +77,6 @@ static void MRLog(const char *fmt, ...) {
     pthread_mutex_unlock(&gLock);
 }
 
-// ── 域名判定 ─────────────────────────────────────────────────────────
 static int isGameloft(const char *host) {
     if (!host || !*host) return 0;
     if (strcmp(host, "127.0.0.1") == 0) return 0;
@@ -86,14 +88,14 @@ static int isGameloft(const char *host) {
     return 0;
 }
 
-// ── 原函数跳板 ───────────────────────────────────────────────────────
 static int  (*orig_connect)(int, const struct sockaddr *, socklen_t);
 static int  (*orig_getaddrinfo)(const char *, const char *,
                                 const struct addrinfo *, struct addrinfo **);
 static struct hostent *(*orig_gethostbyname)(const char *);
 
-// ── connect 包装 ─────────────────────────────────────────────────────
 static int MRConnect(int fd, const struct sockaddr *addr, socklen_t len) {
+    gConnectCalls++;
+
     if (addr && (addr->sa_family == AF_INET || addr->sa_family == AF_INET6)) {
         int port = 0;
         if (addr->sa_family == AF_INET) {
@@ -102,14 +104,14 @@ static int MRConnect(int fd, const struct sockaddr *addr, socklen_t len) {
             port = ntohs(((const struct sockaddr_in6 *)addr)->sin6_port);
         }
 
-        if (kHookAnyPort || port == 443 || port == 80) {
-            char ip[64] = "?";
-            if (addr->sa_family == AF_INET) {
-                inet_ntop(AF_INET, &((const struct sockaddr_in *)addr)->sin_addr, ip, sizeof(ip));
-            } else {
-                inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)addr)->sin6_addr, ip, sizeof(ip));
-            }
+        char ip[64] = "?";
+        if (addr->sa_family == AF_INET) {
+            inet_ntop(AF_INET, &((const struct sockaddr_in *)addr)->sin_addr, ip, sizeof(ip));
+        } else {
+            inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)addr)->sin6_addr, ip, sizeof(ip));
+        }
 
+        if (kHookAnyPort || port == 443 || port == 80) {
             struct sockaddr_in na;
             memset(&na, 0, sizeof(na));
             na.sin_family = AF_INET;
@@ -117,34 +119,39 @@ static int MRConnect(int fd, const struct sockaddr *addr, socklen_t len) {
             inet_pton(AF_INET, kLocalHost, &na.sin_addr);
             na.sin_len = sizeof(na);
 
+            gConnectRedirects++;
             MRLog("REDIR %s:%d -> %s:%d", ip, port, kLocalHost, kLocalPort);
             return orig_connect(fd, (const struct sockaddr *)&na, sizeof(na));
         }
+
+        MRLog("PASS  %s:%d (不重定向)", ip, port);
     }
     return orig_connect(fd, addr, len);
 }
 
-// ── getaddrinfo 包装 ─────────────────────────────────────────────────
 static int MRGetaddrinfo(const char *node, const char *service,
                          const struct addrinfo *hints, struct addrinfo **res) {
+    gGaCalls++;
     if (isGameloft(node)) {
+        gGaHits++;
         const char *port = service ? service : "443";
         MRLog("DNS %s:%s -> %s:%s", node, port, kLocalHost, port);
         return orig_getaddrinfo(kLocalHost, port, hints, res);
     }
+    if (node) MRLog("DNS-other %s", node);
     return orig_getaddrinfo(node, service, hints, res);
 }
 
-// ── gethostbyname 包装 ───────────────────────────────────────────────
 static struct hostent *MRGethostbyname(const char *name) {
+    gGhCalls++;
     if (isGameloft(name)) {
+        gGhHits++;
         MRLog("DNS(byname) %s -> %s", name, kLocalHost);
         return orig_gethostbyname(kLocalHost);
     }
     return orig_gethostbyname(name);
 }
 
-// ── 装载 ─────────────────────────────────────────────────────────────
 void *MRFindSubstrateSymbol(const char *name) {
     const char *libs[] = {
         "Substrate", "CydiaSubstrate", "libsubstrate.dylib",
@@ -159,12 +166,8 @@ void *MRFindSubstrateSymbol(const char *name) {
         if (!h) h = dlopen(libs[i], RTLD_LAZY);
         if (!h) continue;
         void *p = dlsym(h, name);
-        if (p) {
-            MRLog("从 %s 取到 %s = %p", libs[i], name, p);
-            return p;
-        }
+        if (p) { MRLog("从 %s 取到 %s = %p", libs[i], name, p); return p; }
     }
-    // 有时注入库已把符号放进全局表
     void *p = dlsym(RTLD_DEFAULT, name);
     if (p) MRLog("从 RTLD_DEFAULT 取到 %s = %p", name, p);
     return p;
@@ -174,14 +177,11 @@ __attribute__((constructor))
 static void MRNetInit(void) {
     logOpen();
     MRLog("========== MRNet 载入 ==========");
-
-    NSBundle *b = [NSBundle mainBundle];
-    MRLog("bundle = %s", [[b bundleIdentifier] UTF8String] ?: "?");
+    MRLog("bundle = %s", [[[NSBundle mainBundle] bundleIdentifier] UTF8String] ?: "?");
     MRLog("目标   = %s:%d  hookAnyPort=%d", kLocalHost, kLocalPort, kHookAnyPort);
 
     int hooked = 0;
 
-    // ── 路线 1：MSHookFunction ──
     void *sym = MRFindSubstrateSymbol("MSHookFunction");
     if (sym) {
         MSHookFunction_t hookFn = (MSHookFunction_t)sym;
@@ -196,7 +196,6 @@ static void MRNetInit(void) {
         MRLog("路线1 MSHookFunction 不可用，转用 fishhook");
     }
 
-    // ── 路线 2：fishhook（无依赖，兜底）──
     if (hooked == 0) {
         struct mr_rebinding rb[] = {
             { "connect",       (void *)MRConnect,       (void **)&orig_connect },
@@ -208,16 +207,13 @@ static void MRNetInit(void) {
         hooked = n;
     }
 
-    if (hooked == 0) {
-        MRLog("❌ 两条路线都失败，未拦截任何网络调用");
-    } else {
-        MRLog("✅ 已生效 %d 处", hooked);
-    }
+    MRLog(hooked ? "✅ 已生效" : "❌ 两条路线都失败");
 
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        for (int i = 1; i <= 60; i++) {
+        for (int i = 1; i <= 90; i++) {
             sleep(10);
-            MRLog("HEARTBEAT #%d", i);
+            MRLog("STAT #%d connect=%d(重定向%d) dns=%d(命中%d) byname=%d(命中%d)",
+                  i, gConnectCalls, gConnectRedirects, gGaCalls, gGaHits, gGhCalls, gGhHits);
         }
     });
 }
