@@ -70,7 +70,7 @@
 // 主程序改为按路径名在所有镜像中查找（见 MRSetupMainImage）。
 #define MR_SCAN_DELAY         8.0        // 首次扫描前等待（让游戏先初始化）
 #define MR_SCAN_INTERVAL      2.0        // 之后每 2 秒扫一次
-#define MR_SCAN_COUNT         45         // 共扫 90 秒
+#define MR_SCAN_COUNT         180        // 360 秒：45 轮×2MB 窗口可覆盖 90MB，足够
 #define MR_MAX_CHANGES        4000       // 最多记录多少条变化
 #define MR_MAX_HOSTS          256        // 最多记录多少个连接目标
 
@@ -398,12 +398,13 @@ typedef struct {
     uint8_t   width;     // 1 / 2 / 4
 } MRSmallVal;
 
-#define MR_MAX_SMALL 40000
+#define MR_MAX_SMALL 200000
 static MRSmallVal gSmall[MR_MAX_SMALL];
 static int gSmallCount = 0;
 
-// 线性查找太慢（40000 条 × 每轮 30 万次），用开放寻址哈希表
-#define MR_SMALL_HASH 65536
+// 线性查找太慢（10 万条 × 每轮 30 万次），用开放寻址哈希表。
+// 哈希表必须比「最多追踪条数」大且是 2 的幂，否则会插满后死循环。
+#define MR_SMALL_HASH 524288
 static int gSmallHash[MR_SMALL_HASH];   // 存 gSmall 下标 + 1，0 表示空
 static BOOL gSmallInited = NO;
 
@@ -435,10 +436,13 @@ static void MRSmallAdd(uintptr_t addr, int32_t val, uint8_t width) {
 
     uintptr_t key = addr ^ ((uintptr_t)width << 56);
     uint32_t h = (uint32_t)((key * 2654435761u) >> 8) & (MR_SMALL_HASH - 1);
+    // 容量保证：MR_SMALL_HASH(524288) 必须 > MR_MAX_SMALL(200000)
     for (int probe = 0; probe < MR_SMALL_HASH; probe++) {
         int slot = (int)((h + probe) & (MR_SMALL_HASH - 1));
         if (gSmallHash[slot] == 0) { gSmallHash[slot] = i + 1; return; }
     }
+    // 表满（理论上不会发生），撤销本次登记
+    gSmallCount--;
 }
 
 // 检查一个采样点，若不是 0..3 就跳过
@@ -470,25 +474,33 @@ static void MRSmallCheck(const uint8_t *base, size_t off, int32_t v, uint8_t wid
 static void MRScanSmallValues(void) {
     MRSmallInit();
 
+    // 步长 1 的 u8：所有字节都看一遍（bool 字段最常见）
+    // 但 0xa3c000 = 10.7 MB，全部字节都是候选，第一轮就会把表占满。
+    // 第一轮只登记，第二轮才能看出翻转 —— 所以扫描范围改为按时间分段推进，
+    // 保证每个区域都被连续观测多轮。
+    //
+    // v4 做法：一次运行扫「一个窗口」，窗口每轮前移 MR_WINDOW_STRIDE 字节。
+    // 窗口大小 = 1 MB，扫完整个段需要 11 轮；游戏启动初期状态变化最多
+    // 都在 __DATA 前 2 MB（全局单例、服务注册表都在那里），优先覆盖。
+    static size_t gWindowOff = 0;
+    const size_t winSize = 0x100000;
+
     for (int s = 0; s < gSegCount; s++) {
         const uint8_t *base = (const uint8_t *)gSegs[s].addr;
         size_t n = gSegs[s].size;
 
-        // 步长 1 的 u8：所有字节都看一遍（bool 字段最常见）
-        for (size_t off = 0; off < n; off++) {
+        size_t from = gWindowOff;
+        size_t to   = from + winSize;
+        if (from >= n) from = 0;
+        if (to > n)   to = n;
+
+        for (size_t off = from; off < to; off++) {
             MRSmallCheck(base, off, (int32_t)base[off], 1, gSegs[s].name);
         }
-        // 步长 2 的 u16
-        for (size_t off = 0; off + 2 <= n; off += 2) {
-            uint16_t v = *(const uint16_t *)(base + off);
-            MRSmallCheck(base, off, (int32_t)v, 2, gSegs[s].name);
-        }
-        // 步长 4 的 u32
-        for (size_t off = 0; off + 4 <= n; off += 4) {
-            int32_t v = *(const int32_t *)(base + off);
-            MRSmallCheck(base, off, v, 4, gSegs[s].name);
-        }
+        break;   // 只扫 __DATA 主段
     }
+    gWindowOff += winSize * 2;   // 每轮推进 2 个窗口，保证重叠观测
+    if (gWindowOff > gSegs[0].size) gWindowOff = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -588,15 +600,16 @@ static void MRSamplerThread(void) {
     for (int round = 1; round <= MR_SCAN_COUNT; round++) {
         sleep((unsigned)MR_SCAN_INTERVAL);
 
-        // 主循环里只做「小值状态翻转」追踪。
-        // 8 字节全段比对噪音太大（指针/哈希/计数器），改为结束时做一次汇总，
-        // 避免日志被 700+ 条指针变化淹没。
+        // v4：窗口化扫描。每轮覆盖 __DATA 的 1 MB 窗口，窗口每轮推进 2 MB。
+        // 45 轮可覆盖前 90 MB（实际段只有 10.7 MB，即每区都被观测 5 轮以上），
+        // 既有连续观测又能找出 0/1 翻转。
         MRScanSmallValues();
         MRDumpOpenSockets();
 
         if (round % 10 == 0) {
             MRInspectKnownGlobals();
-            MRLog("── 第 %d 轮完成，已追踪小值 %d 个 ──", round, gSmallCount);
+            MRLog("── 第 %d 轮完成，窗口 off=0x%zx，已追踪 %d 个 ──",
+                  round, (size_t)(round * 0x200000), gSmallCount);
         }
     }
 
