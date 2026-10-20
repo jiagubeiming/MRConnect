@@ -1,0 +1,8 @@
+{
+    Filter = {
+        Bundles = (
+            "com.gameloft.despicableme2",
+            "com.gameloft.despicableme211"
+        );
+    };
+}
