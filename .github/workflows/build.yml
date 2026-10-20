@@ -1,0 +1,58 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show env
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Fetch logos.pl
+        run: |
+          git clone --depth=1 https://github.com/theos/theos.git "$RUNNER_TEMP/theos" || true
+          ls "$RUNNER_TEMP/theos/bin" || true
+
+      - name: Build MRProbe.dylib
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          mkdir -p out
+          xcrun --sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=14.0 \
+            -isysroot "$SDK" -dynamiclib -O2 -fobjc-arc \
+            -framework Foundation -framework UIKit -framework CoreFoundation \
+            -o out/MRProbe.dylib Probe.mm
+          xcrun --sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=14.0 \
+            -isysroot "$SDK" -dynamiclib -O2 -fobjc-arc \
+            -framework Foundation -framework UIKit -framework CoreFoundation \
+            -o out/MRConnect.dylib Tweak.mm
+          ls -la out/
+
+      - name: Sign
+        run: |
+          set -euo pipefail
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -S out/MRProbe.dylib
+            ldid -S out/MRConnect.dylib
+          else
+            curl -sL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64 -o /tmp/ldid || \
+            curl -sL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_x86_64 -o /tmp/ldid
+            chmod +x /tmp/ldid
+            /tmp/ldid -S out/MRProbe.dylib
+            /tmp/ldid -S out/MRConnect.dylib
+          fi
+          file out/*.dylib || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MRConnect-dylibs
+          path: out/*.dylib
