@@ -66,6 +66,11 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
+#import <mach/mach.h>
+#import <mach/vm_region.h>
+#import <mach/vm_prot.h>
+
+// 修复：MRLog 需要用 NSString 做格式串（可变参数不能直接传 std::string）
 
 // ═══════════════════════════════════════════════════════════
 //  配置
@@ -115,6 +120,7 @@ static void MROpenLog(void) {
     }
 }
 
+// MRLog 统一入口：C 格式串 + 可变参数（调用的地方都用 C 字符串格式）
 static void MRLog(const char *fmt, ...) {
     char msg[1200];
     va_list ap;
@@ -214,7 +220,7 @@ static int MRConnect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
 
     if (changed) {
         if (!MRMarkSeen(desc)) {
-            MRLog(@"connect 劫持 %s -> %s:%d", desc, MR_LOCAL_HOST, MR_LOCAL_PORT);
+            MRLog("connect 劫持 %s -> %s:%d", desc, MR_LOCAL_HOST, MR_LOCAL_PORT);
         }
         return orig(fd, (struct sockaddr *)&newAddr, addrlen);
     }
@@ -243,7 +249,7 @@ static int MRGetaddrinfo(const char *node, const char *service,
     if (n > 0) {
         char key[160];
         snprintf(key, sizeof(key), "dns:%s", node);
-        if (!MRMarkSeen(key)) MRLog(@"getaddrinfo 改写 %s -> 127.0.0.1（%d 条）", node, n);
+        if (!MRMarkSeen(key)) MRLog("getaddrinfo 改写 %s -> 127.0.0.1 (%d 条)", node, n);
     }
     return r;
 }
@@ -252,25 +258,18 @@ static int MRGetaddrinfo(const char *node, const char *service,
 //  GOT 槽改写
 // ═══════════════════════════════════════════════════════════
 
-// 把一段内存改成可写，返回原保护
+// 把一段内存改成可写
 static int MRMakeWritable(void *addr, size_t len, int *savedProt) {
     long pageSize = sysconf(_SC_PAGESIZE);
     uintptr_t start = (uintptr_t)addr & ~(uintptr_t)(pageSize - 1);
     uintptr_t end   = ((uintptr_t)addr + len + pageSize - 1) & ~(uintptr_t)(pageSize - 1);
     size_t   sz     = end - start;
 
-    vm_prot_t cur = 0, max = 0;
-    vm_address_t a = (vm_address_t)start;
-    vm_size_t s = (vm_size_t)sz;
-    if (vm_region_64(mach_task_self(), &a, &s, VM_REGION_BASIC_INFO_64,
-                     NULL, NULL, NULL) != KERN_SUCCESS) {
-        // 退而求其次：直接强改
-        if (mprotect((void *)start, sz, PROT_READ | PROT_WRITE) != 0) return -1;
-        *savedProt = PROT_READ;
-        return 0;
+    // 直接改页保护即可（__DATA 段本来就在可写区，__DATA_CONST 需要这一步）
+    if (mprotect((void *)start, sz, PROT_READ | PROT_WRITE) != 0) {
+        return -1;
     }
-    if (mprotect((void *)start, sz, PROT_READ | PROT_WRITE) != 0) return -1;
-    *savedProt = (int)cur;
+    *savedProt = PROT_READ;
     return 0;
 }
 
@@ -304,14 +303,14 @@ static int MRPatchSection(const struct mach_header_64 *hdr,
                             if (strcmp(info.dli_sname, symName) == 0) {
                                 int saved = 0;
                                 if (MRMakeWritable(&slots[k], sizeof(void *), &saved) != 0) {
-                                    MRLog(@"  %s/%s[%zu] = %s 但 mprotect 失败",
-                                          segName, sectName, k, symName);
+                                    MRLog("  %s/%s[%lu] = %s 但 mprotect 失败",
+                                          segName, sectName, (unsigned long)k, symName);
                                     continue;
                                 }
                                 *oldOut = cur;
                                 slots[k] = replacement;
-                                MRLog(@"  命中 %s/%s[%zu] %s  %p -> %p",
-                                      segName, sectName, k, symName, cur, replacement);
+                                MRLog("  命中 %s/%s[%lu] %s  %p -> %p",
+                                      segName, sectName, (unsigned long)k, symName, cur, replacement);
                                 return 1;
                             }
                         }
@@ -332,15 +331,15 @@ __attribute__((constructor))
 static void MRConnectInit(void) {
     MROpenLog();
 
-    MRLog(@"==== MRConnect 载入 ====");
-    MRLog(@"bundle = %s", [[[NSBundle mainBundle] bundleIdentifier] UTF8String]);
-    MRLog(@"日志   = %s", gLogPath);
-    MRLog(@"目标   = %s:%d  hijackAll=%d", MR_LOCAL_HOST, MR_LOCAL_PORT, gHijackAll);
+    MRLog("==== MRConnect 载入 ====");
+    MRLog("bundle = %s", [[[NSBundle mainBundle] bundleIdentifier] UTF8String]);
+    MRLog("日志   = %s", gLogPath);
+    MRLog("目标   = %s:%d  hijackAll=%d", MR_LOCAL_HOST, MR_LOCAL_PORT, (int)gHijackAll);
 
     // 先用 dlsym 取原始实现（作为 fallback，也用于对比）
     gOrigConnect     = (connect_t)dlsym(RTLD_DEFAULT, "connect");
     gOrigGetaddrinfo = (getaddrinfo_t)dlsym(RTLD_DEFAULT, "getaddrinfo");
-    MRLog(@"dlsym: connect=%p getaddrinfo=%p", gOrigConnect, gOrigGetaddrinfo);
+    MRLog("dlsym: connect=%p getaddrinfo=%p", (void*)gOrigConnect, (void*)gOrigGetaddrinfo);
 
     const struct mach_header_64 *hdr =
         (const struct mach_header_64 *)_dyld_get_image_header(0);
@@ -355,7 +354,7 @@ static void MRConnectInit(void) {
             q += lc->cmdsize;
         }
     }
-    MRLog(@"chained fixups = %s", hasChained ? "YES（槽内是编码值，下列改写可能无效）"
+    MRLog("chained fixups = %s", hasChained ? "YES（槽内是编码值，下列改写可能无效）"
                                              : "NO （槽内是真实地址，可直接改写）");
 
     // 依次在几个可能的段里找
@@ -376,10 +375,10 @@ static void MRConnectInit(void) {
         okD = MRPatchSection(hdr, segs[i], "__la_symbol_ptr", "getaddrinfo",
                              (void *)MRGetaddrinfo, &old2);
 
-    MRLog(@"改写结果: connect=%d getaddrinfo=%d", okC, okD);
+    MRLog("改写结果: connect=%d getaddrinfo=%d", okC, okD);
 
     if (!okC) {
-        MRLog(@"⚠ connect 槽未命中！退回到 inline hook 方式");
+        MRLog("connect 槽未命中！退回到 inline hook 方式");
         // 说明主程序没有直接引用 connect（可能全在 libcurl 里）
         // 这种情况下面用 dlopen 的钩子兜底
     }
@@ -388,7 +387,7 @@ static void MRConnectInit(void) {
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
         for (int i = 1; i <= 40; i++) {
             sleep(15);
-            MRLog(@"HEARTBEAT #%d  seen=%d", i, gSeenCount);
+            MRLog("HEARTBEAT #%d  seen=%d", i, gSeenCount);
         }
     });
 }
