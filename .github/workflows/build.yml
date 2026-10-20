@@ -35,6 +35,10 @@ jobs:
             -isysroot "$SDK" -dynamiclib -O2 -fobjc-arc \
             -framework Foundation -framework UIKit -framework CoreFoundation \
             -o out/MRConnect.dylib Tweak.mm
+          xcrun --sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=14.0 \
+            -isysroot "$SDK" -dynamiclib -O2 -fobjc-arc \
+            -framework Foundation -framework UIKit -framework CoreFoundation \
+            -o out/MRState.dylib MRState.mm
           ls -la out/
 
       - name: Sign
@@ -43,12 +47,14 @@ jobs:
           if command -v ldid >/dev/null 2>&1; then
             ldid -S out/MRProbe.dylib
             ldid -S out/MRConnect.dylib
+            ldid -S out/MRState.dylib
           else
             curl -sL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64 -o /tmp/ldid || \
             curl -sL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_x86_64 -o /tmp/ldid
             chmod +x /tmp/ldid
             /tmp/ldid -S out/MRProbe.dylib
             /tmp/ldid -S out/MRConnect.dylib
+            /tmp/ldid -S out/MRState.dylib
           fi
           file out/*.dylib || true
 
