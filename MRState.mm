@@ -66,7 +66,8 @@
 //  配置
 // ═══════════════════════════════════════════════════════════════════
 
-#define MR_MAIN_IMAGE_INDEX   0          // 主程序是第 0 个镜像
+// 注意：越狱下第 0 个镜像是 systemhook-*.dylib，不能硬编码 0。
+// 主程序改为按路径名在所有镜像中查找（见 MRSetupMainImage）。
 #define MR_SCAN_DELAY         8.0        // 首次扫描前等待（让游戏先初始化）
 #define MR_SCAN_INTERVAL      2.0        // 之后每 2 秒扫一次
 #define MR_SCAN_COUNT         45         // 共扫 90 秒
@@ -146,18 +147,50 @@ static void MRLog(const char *fmt, ...) {
 static const struct mach_header_64 *gMainHdr = NULL;
 static intptr_t gSlide = 0;
 
+// 越狱环境（Dopamine/ellekit）下 _dyld_get_image_header(0) 往往不是主程序，
+// 而是 systemhook-XXXX.dylib。必须按路径名在所有已加载镜像里查找 DespicableMe。
+static BOOL MRLooksLikeMainExecutable(const char *name) {
+    if (!name || !*name) return NO;
+    if (strstr(name, "systemhook")) return NO;      // Dopamine 的劫持壳
+    if (strstr(name, ".dylib")) return NO;          // 任何 dylib 都不算
+    if (!strstr(name, "DespicableMe")) return NO;   // 主程序文件名
+    return YES;
+}
+
 static BOOL MRSetupMainImage(void) {
-    const struct mach_header *h = _dyld_get_image_header(MR_MAIN_IMAGE_INDEX);
-    if (!h) return NO;
-    if (h->magic != MH_MAGIC_64) return NO;
+    const struct mach_header *best = NULL;
+    intptr_t bestSlide = 0;
+    const char *bestName = NULL;
 
-    gMainHdr = (const struct mach_header_64 *)h;
-    gSlide = _dyld_get_image_vmaddr_slide(MR_MAIN_IMAGE_INDEX);
+    uint32_t n = _dyld_image_count();
+    MRLog("已加载镜像 %u 个，开始查找主程序", n);
 
-    // 主程序必须是 DespicableMe，不是插件自己
-    const char *name = _dyld_get_image_name(MR_MAIN_IMAGE_INDEX);
-    MRLog("主程序镜像 = %s", name ? name : "?");
-    MRLog("  基址 = %p  slide = %p", (void *)h, (void *)gSlide);
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!MRLooksLikeMainExecutable(nm)) continue;
+        const struct mach_header *h = _dyld_get_image_header(i);
+        if (!h || h->magic != MH_MAGIC_64) continue;
+        // 主程序特征：数据段很大（几十 MB），用 __TEXT 大小粗筛
+        best     = h;
+        bestSlide = _dyld_get_image_vmaddr_slide(i);
+        bestName = nm;
+        MRLog("  命中 #%u %s", i, nm);
+        break;
+    }
+
+    if (!best) {
+        MRLog("❌ 未找到 DespicableMe 主程序镜像，列出全部：");
+        for (uint32_t i = 0; i < n && i < 80; i++) {
+            MRLog("    #%u %s", i, _dyld_get_image_name(i) ? _dyld_get_image_name(i) : "?");
+        }
+        return NO;
+    }
+
+    gMainHdr = (const struct mach_header_64 *)best;
+    gSlide   = bestSlide;
+
+    MRLog("主程序镜像 = %s", bestName);
+    MRLog("  基址 = %p  slide = %p", (void *)best, (void *)gSlide);
     return YES;
 }
 
