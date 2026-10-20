@@ -326,7 +326,7 @@ static void MRFirstSnapshot(void) {
     MRLog("基线快照完成（%d 段）", gSegCount);
 }
 
-static void MRCompareSnapshot(void) {
+__attribute__((unused)) static void MRCompareSnapshot(void) {
     int found = 0;
     for (int s = 0; s < gSegCount; s++) {
         if (!gSnap[s]) continue;
@@ -382,52 +382,111 @@ static void MRCompareSnapshot(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  可疑状态值专查
+//  可疑状态值专查（v3）
 // ═══════════════════════════════════════════════════════════════════
 //
-//  「在线 / 离线」通常是 1 个字节或 1 个 int。
-//  这里额外扫描所有值恰好是 0/1/2 的 int，并追踪它们何时变换。
+//  「在线 / 离线」通常是 1 个字节（C++ bool）或 1 个 int。
+//  v2 只按 int32 扫，漏掉了最常见的情况：bool 占 1 字节，
+//  后面 3 字节是别的字段，int32 读出来是 256 / 65536 这类大值 → 被 v > 3 过滤掉。
+//
+//  v3 同时按 u8（步长 1）、u16（步长 2）、u32（步长 4）三种宽度扫描，
+//  任一宽度的值落在 0..3 就纳入追踪。命中时打印宽度，便于判断类型。
 
 typedef struct {
     uintptr_t addr;
     int32_t   last;
+    uint8_t   width;     // 1 / 2 / 4
 } MRSmallVal;
 
-#define MR_MAX_SMALL 8000
+#define MR_MAX_SMALL 40000
 static MRSmallVal gSmall[MR_MAX_SMALL];
 static int gSmallCount = 0;
 
+// 线性查找太慢（40000 条 × 每轮 30 万次），用开放寻址哈希表
+#define MR_SMALL_HASH 65536
+static int gSmallHash[MR_SMALL_HASH];   // 存 gSmall 下标 + 1，0 表示空
+static BOOL gSmallInited = NO;
+
+static void MRSmallInit(void) {
+    if (gSmallInited) return;
+    memset(gSmallHash, 0, sizeof(gSmallHash));
+    gSmallInited = YES;
+}
+
+static int MRSmallFind(uintptr_t addr, uint8_t width) {
+    uintptr_t key = addr ^ ((uintptr_t)width << 56);
+    uint32_t h = (uint32_t)((key * 2654435761u) >> 8) & (MR_SMALL_HASH - 1);
+    for (int probe = 0; probe < MR_SMALL_HASH; probe++) {
+        int slot = (int)((h + probe) & (MR_SMALL_HASH - 1));
+        int idx = gSmallHash[slot];
+        if (idx == 0) return -1;
+        int i = idx - 1;
+        if (gSmall[i].addr == addr && gSmall[i].width == width) return i;
+    }
+    return -1;
+}
+
+static void MRSmallAdd(uintptr_t addr, int32_t val, uint8_t width) {
+    if (gSmallCount >= MR_MAX_SMALL) return;
+    int i = gSmallCount++;
+    gSmall[i].addr = addr;
+    gSmall[i].last = val;
+    gSmall[i].width = width;
+
+    uintptr_t key = addr ^ ((uintptr_t)width << 56);
+    uint32_t h = (uint32_t)((key * 2654435761u) >> 8) & (MR_SMALL_HASH - 1);
+    for (int probe = 0; probe < MR_SMALL_HASH; probe++) {
+        int slot = (int)((h + probe) & (MR_SMALL_HASH - 1));
+        if (gSmallHash[slot] == 0) { gSmallHash[slot] = i + 1; return; }
+    }
+}
+
+// 检查一个采样点，若不是 0..3 就跳过
+static void MRSmallCheck(const uint8_t *base, size_t off, int32_t v, uint8_t width,
+                         const char *segName) {
+    if (v < 0 || v > 3) return;
+    uintptr_t addr = (uintptr_t)(base + off);
+
+    int i = MRSmallFind(addr, width);
+    if (i < 0) {
+        MRSmallAdd(addr, v, width);
+        return;
+    }
+    if (gSmall[i].last == v) return;
+
+    int32_t old = gSmall[i].last;
+    gSmall[i].last = v;
+
+    // 只关心「小值 → 小值」的翻转，这是布尔/枚举状态的典型特征
+    if (old == 1 && v == 0) {
+        MRLog("★★ 1->0  %s+0x%zx  (u%d)  ←可能「在线→离线」", segName, off, width * 8);
+    } else if (old == 0 && v == 1) {
+        MRLog("★  0->1  %s+0x%zx  (u%d)", segName, off, width * 8);
+    } else {
+        MRLog("~~ %d->%d  %s+0x%zx  (u%d)", old, v, segName, off, width * 8);
+    }
+}
+
 static void MRScanSmallValues(void) {
-    // 只在 __DATA 主段找，范围可控
-    if (gSegCount == 0) return;
-    const uint8_t *base = (const uint8_t *)gSegs[0].addr;
-    size_t n = gSegs[0].size;
+    MRSmallInit();
 
-    for (size_t off = 0; off + 4 <= n; off += 4) {
-        int32_t v = *(const int32_t *)(base + off);
-        if (v < 0 || v > 3) continue;
+    for (int s = 0; s < gSegCount; s++) {
+        const uint8_t *base = (const uint8_t *)gSegs[s].addr;
+        size_t n = gSegs[s].size;
 
-        BOOL found = NO;
-        for (int k = 0; k < gSmallCount; k++) {
-            if (gSmall[k].addr == (uintptr_t)(base + off)) {
-                if (gSmall[k].last != v) {
-                    // 状态值翻转 —— 高价值事件
-                    if (gSmall[k].last == 1 && v == 0) {
-                        MRLog("★★ 1->0  %s+0x%zx  （可能是「在线 -> 离线」）",
-                              gSegs[0].name, off);
-                    } else if (gSmall[k].last == 0 && v == 1) {
-                        MRLog("★  0->1  %s+0x%zx", gSegs[0].name, off);
-                    }
-                    gSmall[k].last = v;
-                }
-                found = YES;
-                break;
-            }
+        // 步长 1 的 u8：所有字节都看一遍（bool 字段最常见）
+        for (size_t off = 0; off < n; off++) {
+            MRSmallCheck(base, off, (int32_t)base[off], 1, gSegs[s].name);
         }
-        if (!found && gSmallCount < MR_MAX_SMALL) {
-            gSmall[gSmallCount].addr = (uintptr_t)(base + off);
-            gSmall[gSmallCount].last = v;
-            gSmallCount++;
+        // 步长 2 的 u16
+        for (size_t off = 0; off + 2 <= n; off += 2) {
+            uint16_t v = *(const uint16_t *)(base + off);
+            MRSmallCheck(base, off, (int32_t)v, 2, gSegs[s].name);
+        }
+        // 步长 4 的 u32
+        for (size_t off = 0; off + 4 <= n; off += 4) {
+            int32_t v = *(const int32_t *)(base + off);
+            MRSmallCheck(base, off, v, 4, gSegs[s].name);
         }
     }
 }
@@ -529,42 +588,21 @@ static void MRSamplerThread(void) {
     for (int round = 1; round <= MR_SCAN_COUNT; round++) {
         sleep((unsigned)MR_SCAN_INTERVAL);
 
-        MRCompareSnapshot();
+        // 主循环里只做「小值状态翻转」追踪。
+        // 8 字节全段比对噪音太大（指针/哈希/计数器），改为结束时做一次汇总，
+        // 避免日志被 700+ 条指针变化淹没。
         MRScanSmallValues();
         MRDumpOpenSockets();
 
         if (round % 10 == 0) {
             MRInspectKnownGlobals();
-            MRLog("── 第 %d 轮完成，变化点 %d ──", round, gChangeCount);
+            MRLog("── 第 %d 轮完成，已追踪小值 %d 个 ──", round, gSmallCount);
         }
     }
 
     MRLog("════════ 扫描结束 ════════");
     MRInspectKnownGlobals();
     MRDumpKnownHosts();
-
-    // 输出所有已记录的变化点（按变化次数排序）
-    MRLog("全部变化点（累计 %d）：", gChangeCount);
-    // 冒泡取前 60 个高价值（变化次数多的 + 小值的）
-    int shown = 0;
-    for (int pass = 0; pass < 60 && shown < 60; pass++) {
-        int best = -1, bestCnt = 0;
-        for (int k = 0; k < gChangeCount; k++) {
-            if (gChanges[k].count > bestCnt && gChanges[k].count < 100000) {
-                BOOL done = NO;
-                for (int p = 0; p < shown; p++) { /* 已打印的不重复 */ }
-                if (!done) { best = k; bestCnt = gChanges[k].count; }
-            }
-        }
-        if (best < 0) break;
-        MRLog("  %s+0x%-6zx  %llu->%llu  次数=%d",
-              gSegs[gChanges[best].segIdx].name, gChanges[best].off,
-              (unsigned long long)gChanges[best].oldval,
-              (unsigned long long)gChanges[best].newval,
-              gChanges[best].count);
-        gChanges[best].count = 100000;   // 标记已打印
-        shown++;
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
