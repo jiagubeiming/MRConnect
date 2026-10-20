@@ -16,13 +16,11 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
 
-      - name: Fetch substrate headers
+      - name: Check substrate header
         run: |
           set -euo pipefail
-          mkdir -p inc
-          curl -sL https://raw.githubusercontent.com/theos/headers/master/substrate.h -o inc/substrate.h
-          head -5 inc/substrate.h
           wc -l inc/substrate.h
+          grep -n "MSHookFunction" inc/substrate.h
 
       - name: Build dylibs
         run: |
