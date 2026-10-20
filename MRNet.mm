@@ -17,8 +17,8 @@
 #import <unistd.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
-#include <netinet/in6.h>
-#import <arpa/inet.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #import <netdb.h>
 #import <pthread.h>
 
