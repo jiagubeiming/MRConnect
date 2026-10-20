@@ -30,7 +30,7 @@ jobs:
           mkdir -p out
           CFLAGS="-arch arm64 -miphoneos-version-min=14.0 -isysroot $SDK -dynamiclib -O2 -fobjc-arc -Iinc"
           FW="-framework Foundation -framework UIKit -framework CoreFoundation"
-          xcrun --sdk iphoneos clang++ $CFLAGS $FW -o out/MRNet.dylib MRNet.mm
+          xcrun --sdk iphoneos clang++ $CFLAGS $FW -o out/MRNet.dylib MRNet.mm fishhook.c
           ls -la out/
 
       - name: Sign
